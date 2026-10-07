@@ -102,3 +102,34 @@ def test_a_request_refused_with_udfs_is_filed_again_without_them():
 def test_missing_portal_is_refused_at_construction():
     with pytest.raises(RuntimeError, match="SDP_PORTAL"):
         ServiceDeskFiler(NS(**{**vars(_SETTINGS), "sdp_portal": None}))
+
+
+def test_the_customers_queue_and_sla_priority_are_on_the_request():
+    portal = Portal()
+    portal.filer().create_request("s", "d", {"udf_char1": "VM1"}, queue="ISSE-CustomerA",
+                                  priority="High")
+
+    sent = _sent(portal.request_calls[0])
+    assert sent["group"] == {"name": "ISSE-CustomerA"}
+    assert sent["priority"] == {"name": "High"}
+
+
+def test_a_rejected_request_drops_udfs_and_priority_but_never_the_queue():
+    refusal = (400, {"response_status": {"status_code": 4000, "messages": ["priority"]}})
+    portal = Portal(request_answers=[refusal, (201, {"request": {"id": "9"}})])
+    created = portal.filer().create_request("s", "d", {"udf_char1": "VM1"},
+                                            queue="ISSE-CustomerA", priority="Sev-High")
+
+    retry = _sent(portal.request_calls[1])
+    assert created.ok
+    assert retry == {"subject": "s", "description": "d", "group": {"name": "ISSE-CustomerA"}}
+    assert "without UDFs and priority" in created.detail
+
+
+def test_a_queue_the_portal_refuses_is_a_failure_not_a_request_without_one():
+    refusal = (400, {"response_status": {"status_code": 4000, "messages": ["group"]}})
+    portal = Portal(request_answers=[refusal])
+    created = portal.filer().create_request("s", "d", queue="No-Such-Queue")
+
+    assert not created.ok
+    assert len(portal.request_calls) == 1

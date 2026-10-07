@@ -30,6 +30,7 @@ from fakes import FakeReader, sample_alert, sample_alert_with_condition  # noqa:
 
 from isse_alert_agent.agent import AlertAgent  # noqa: E402
 from isse_alert_agent.config import Settings  # noqa: E402
+from isse_alert_agent.customers import Customer, Register, Subscription  # noqa: E402
 from isse_alert_agent.models import Alert, AlertCondition  # noqa: E402
 from isse_alert_agent.servicedesk import CreatedRequest  # noqa: E402
 
@@ -39,7 +40,7 @@ _RG = "RG-GG4-STANDALONE-TEST"
 
 def _portal_row(alert: Alert, *, udfs: bool = True, escape_quotes: bool = False) -> dict:
     """The request object ServiceDesk returns for what the agent filed."""
-    description = AlertAgent.description(alert, _RG)
+    description = AlertAgent.description(alert, _RG, "Goodrich")
     if escape_quotes:  # some portals store the body with every quote entity-escaped
         description = html.escape(html.unescape(description), quote=True).replace(
             "&lt;br&gt;", "<br>")
@@ -90,7 +91,8 @@ class _IsseQueueFiler:
     def __init__(self, itsm):
         self._itsm = itsm
 
-    def create_request(self, subject, description, udf_fields=None):
+    def create_request(self, subject, description, udf_fields=None, queue=None,
+                       priority=None):
         t = self._itsm.create_ticket(subject, description, udf_fields=udf_fields)
         return CreatedRequest(id=t.id, ok=True, detail="mock portal")
 
@@ -103,13 +105,20 @@ def _as_agent_alert(a) -> Alert:
     return Alert(**fields)
 
 
-def test_isse_works_a_request_the_agent_filed_end_to_end(tmp_path, monkeypatch):
+_SUB2 = "00000000-0000-0000-0000-0000000second"
+
+
+@pytest.mark.parametrize("second_subscription", [False, True],
+                         ids=["default-subscription", "customers-second-subscription"])
+def test_isse_works_a_request_the_agent_filed_end_to_end(tmp_path, monkeypatch,
+                                                         second_subscription):
     for key in ("OPENAI_BASE_URL", "OPENSHELL_SANDBOX", "ISSE_KILL_SWITCH",
-                "ISSE_ARMED_CLASSES"):
+                "ISSE_ARMED_CLASSES", "ISSE_ALERT_CUSTOMERS_FILE"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("ISSE_MODE", "sim")
     monkeypatch.setenv("ISSE_ALLOW_REMEDIATION", "false")
     monkeypatch.setenv("AZURE_SUBSCRIPTION_ID", _SUB)
+    monkeypatch.setenv("AZURE_SUBSCRIPTION_IDS", _SUB2 if second_subscription else "")
     monkeypatch.setenv("ISSE_SANDBOX_RESOURCE_GROUP", _RG)
     monkeypatch.setenv("ISSE_AUDIT_DB", str(tmp_path / "isse-audit.db"))
     monkeypatch.setenv("ISSE_ALERT_DEDUP_DB", str(tmp_path / "seen.db"))
@@ -126,8 +135,17 @@ def test_isse_works_a_request_the_agent_filed_end_to_end(tmp_path, monkeypatch):
     firing = orch.cloud.get_active_alerts(_RG, "GG4DAXPRD03").firing
     assert firing, "mock estate holds no firing alert for GG4DAXPRD03"
 
-    agent = AlertAgent(Settings(), reader=FakeReader([_as_agent_alert(firing[0])]),
-                       filer=_IsseQueueFiler(orch.itsm))
+    alert = _as_agent_alert(firing[0])
+    register = None
+    if second_subscription:
+        # One customer, two subscriptions: the machine lives in the second.
+        alert.target_ids = [t.replace(_SUB, _SUB2) for t in alert.target_ids]
+        register = Register(source="test", customers=(Customer(
+            name="Goodrich", queue="ISSE-Goodrich",
+            subscriptions=(Subscription(_SUB, (_RG,)), Subscription(_SUB2, (_RG,)))),))
+    reader = FakeReader({_SUB2: [alert]} if second_subscription else [alert])
+    agent = AlertAgent(Settings(), reader=reader, filer=_IsseQueueFiler(orch.itsm),
+                       register=register)
     report = agent.cycle()
     assert len(report.filed) == 1
     ticket = orch.itsm.get_ticket(report.filed[0].ticket_id)
@@ -137,6 +155,11 @@ def test_isse_works_a_request_the_agent_filed_end_to_end(tmp_path, monkeypatch):
     events = {e["action"]: e for e in orch.audit.events_for(result.correlation_id)}
     assert '"alert": null' not in events["intake"]["detail"], "ISSE did not read the alert"
     assert events["alert_target"]["decision"] == "confirmed"
+    if second_subscription:
+        assert events["route_subscription"]["decision"] == "routed"
+        assert _SUB2 in events["route_subscription"]["detail"]
+    else:
+        assert "route_subscription" not in events
     assert result.incident_class == "A_stopped_or_deallocated_vm"
     assert "conflict" not in (result.guardrail_reason or "")
     # Recommend-only: nothing on the machine was changed.

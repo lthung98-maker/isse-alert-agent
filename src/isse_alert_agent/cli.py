@@ -1,10 +1,10 @@
 """Command line: check the setup, look at what Azure holds, file requests, run the loop.
 
-    isse-alerts doctor   read-only preflight: config, Azure alert read, ServiceDesk token
-    isse-alerts list     read-only: print the firing VM alerts Azure holds in scope
+    isse-alerts doctor   read-only preflight: register, every subscription, ServiceDesk token
+    isse-alerts list     read-only: the firing VM alerts Azure holds, per customer
     isse-alerts once     one poll cycle (files requests unless ISSE_ALERT_DRY_RUN)
     isse-alerts watch    poll forever at ISSE_POLL_INTERVAL_SECONDS
-    isse-alerts health   exit non-zero if the watcher has not completed a cycle recently
+    isse-alerts health   exit non-zero if any customer has not been read recently
 """
 
 from __future__ import annotations
@@ -47,12 +47,9 @@ def _configure_logging(s: Settings) -> None:
     root.propagate = False
     # The Azure SDK logs every HTTP request at INFO; that is noise in an operator's journal.
     logging.getLogger("azure").setLevel(logging.WARNING)
-
-
-def _agent(s: Settings):
-    from .agent import AlertAgent
-
-    return AlertAgent(s)
+    # A failed token is raised to the caller, which reports it per subscription; the
+    # library's own multi-line warning would only repeat it.
+    logging.getLogger("azure.identity").setLevel(logging.ERROR)
 
 
 def _settings() -> Settings:
@@ -61,44 +58,81 @@ def _settings() -> Settings:
     return s
 
 
+def _agent(s: Settings):
+    """The agent, or a clean exit if the register cannot be trusted to route alerts."""
+    from .agent import AlertAgent
+    from .customers import RegisterError
+
+    try:
+        return AlertAgent(s)
+    except RegisterError as e:
+        typer.echo(f"Customer register rejected: {e}")
+        raise typer.Exit(code=2) from e
+
+
 @app.command()
 def doctor() -> None:
     """Read-only preflight. Files nothing; exits non-zero if the agent cannot run."""
+    from .customers import RegisterError, load_register
+
     s = _settings()
     problems: list[str] = []
 
-    def line(ok: bool, label: str, detail: str) -> None:
-        typer.echo(f"  [{'ok' if ok else 'FAIL'}] {label}: {detail}")
-        if not ok:
+    def line(ok: bool, label: str, detail: str, warn: bool = False) -> None:
+        mark = "ok" if ok else ("warn" if warn else "FAIL")
+        typer.echo(f"  [{mark}] {label}: {detail}")
+        if not ok and not warn:
             problems.append(label)
 
     typer.echo("Configuration")
-    line(s.azure_is_configured, "Azure subscription",
-         s.azure_subscription_id or "AZURE_SUBSCRIPTION_ID unset")
-    sp = bool(s.azure_client_id and s.azure_client_secret and s.azure_tenant_id)
-    typer.echo(f"  [{'ok' if sp else 'warn'}] Azure credential: "
-               + ("service principal" if sp else
-                  "DefaultAzureCredential (managed identity / az login); use a service "
-                  "principal for unattended running"))
-    groups = s.scope_resource_group_tuple
-    typer.echo(f"  [{'ok' if groups else 'warn'}] Scope: "
-               + (", ".join(groups) if groups else
-                  "ISSE_SANDBOX_RESOURCE_GROUP unset - the WHOLE subscription is in scope"))
-    typer.echo(f"  [ok] Severity floor: Sev0..Sev{s.alert_min_severity}; "
-               f"lookback {s.alert_lookback_hours}h; dry run {'ON' if s.dry_run else 'off'}")
+    register = None
+    try:
+        register = load_register(s)
+        line(bool(register.customers), "Customer register",
+             f"{len(register.customers)} customer(s) from {register.source}"
+             if register.customers else
+             f"no customers ({register.source}); set ISSE_ALERT_CUSTOMERS_FILE")
+    except RegisterError as e:
+        line(False, "Customer register", str(e))
+    for c in register.customers if register else ():
+        prio = (", ".join(f"{k}->{v}" for k, v in sorted(c.priority_by_severity.items()))
+                or "portal default")
+        typer.echo(f"    {c.name}: queue '{c.queue}'; Sev0..Sev{c.min_severity}; "
+                   f"priority {prio}")
+        for sub in c.subscriptions:
+            typer.echo(f"      [{'ok' if sub.resource_groups else 'warn'}] {sub.id}: "
+                       + (", ".join(sub.resource_groups) if sub.resource_groups else
+                          "no resource groups listed - the WHOLE subscription is in scope"))
+    line(s.azure_service_principal, "Azure credential",
+         "service principal (tenant " + str(s.azure_tenant_id) + ")"
+         if s.azure_service_principal else
+         "DefaultAzureCredential (managed identity / az login); use a service "
+         "principal for unattended running", warn=True)
+    typer.echo(f"  [ok] Lookback {s.alert_lookback_hours}h; "
+               f"dry run {'ON' if s.dry_run else 'off'}")
     line(s.sdp_is_configured, "ServiceDesk",
          f"portal {s.sdp_portal}" if s.sdp_is_configured else
          "needs SDP_PORTAL, SDP_CLIENT_ID, SDP_CLIENT_SECRET, SDP_REFRESH_TOKEN")
 
     typer.echo("Reachability (read-only)")
-    if s.azure_is_configured:
-        try:
-            alerts = _agent(s).discover()
-            line(True, "Azure alert read", f"{len(alerts)} firing VM alert(s) in the window")
-        except Exception as e:  # noqa: BLE001
-            hint = (" - the identity needs Monitoring Reader at SUBSCRIPTION scope"
-                    if "authoriz" in str(e).lower() or "403" in str(e) else "")
-            line(False, "Azure alert read", f"{type(e).__name__}: {str(e)[:200]}{hint}")
+    if register and register.customers:
+        from .azure_alerts import AzureAlertReader
+
+        reader = AzureAlertReader(s)
+        for c in register.customers:
+            for sub in c.subscriptions:
+                label = f"Alerts {c.name} / {sub.id}"
+                try:
+                    found = reader.list_fired_alerts(sub.id, hours=s.alert_lookback_hours,
+                                                     max_rank=c.min_severity)
+                    line(True, label, f"{len(found)} firing VM alert(s) in the window")
+                except Exception as e:  # noqa: BLE001
+                    text = " ".join(str(e).split())
+                    hint = (" - the identity needs Monitoring Reader on this subscription "
+                            "(for a customer tenant, delegated through Azure Lighthouse)"
+                            if "authoriz" in text.lower() or "403" in text
+                            or "not found" in text.lower() else "")
+                    line(False, label, f"{type(e).__name__}: {text[:200]}{hint}")
     if s.sdp_is_configured:
         try:
             from .servicedesk import ServiceDeskFiler
@@ -118,29 +152,33 @@ def doctor() -> None:
 def list_alerts() -> None:
     """Read-only: the firing VM alerts Azure holds, and whether each would be filed."""
     s = _settings()
-    try:
-        discovered = _agent(s).discover()
-    except Exception as e:  # noqa: BLE001
-        typer.echo(f"Could not read alerts: {type(e).__name__}: {e}\n"
-                   f"Run `isse-alerts doctor` for a full check.")
-        raise typer.Exit(code=1) from e
-    if not discovered:
-        typer.echo("No firing VM alerts in the window.")
-        return
-    for a in discovered:
-        group = s.scoped_group(a.resource_group)
-        scope = f"in scope ({group})" if group else f"OUT of scope ({a.resource_group})"
-        typer.echo(f"  [{a.severity or '?'}] {a.machine_name}: {a.rule} "
-                   f"fired {a.fired_at or '?'} - {scope}")
-    typer.echo(f"\n{len(discovered)} firing alert(s).")
+    discovery = _agent(s).discover()
+    for d in discovery.found:
+        a = d.alert
+        if d.misrouted:
+            verdict = f"NOT FILED - machine is in subscription {a.subscription}"
+        elif d.group:
+            verdict = f"in scope ({d.group}) -> queue '{d.customer.queue}'"
+        else:
+            verdict = f"OUT of scope ({a.resource_group})"
+        typer.echo(f"  {d.customer.name}  [{a.severity or '?'}] {a.machine_name}: {a.rule} "
+                   f"fired {a.fired_at or '?'} - {verdict}")
+    for error in discovery.errors:
+        typer.echo(f"  could not read {error}")
+    typer.echo(f"\n{len(discovery.found)} firing alert(s); "
+               f"{len(discovery.errors)} subscription(s) unreadable.")
+    if discovery.errors:
+        raise typer.Exit(code=1)
 
 
 @app.command()
 def once() -> None:
-    """One poll cycle, then exit. Exit code 1 if any request failed to file."""
+    """One poll cycle, then exit. Exit code 1 if any request failed or any
+    subscription could not be read."""
     s = _settings()
     report = _agent(s).cycle()
-    if report.failed:
+    _beat(s, report.reached)
+    if report.failed or report.read_errors:
         raise typer.Exit(code=1)
 
 
@@ -160,17 +198,18 @@ def watch(interval: float = typer.Option(None, help="Seconds between polls")) ->
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    log.info("ISSE alert agent started: %s; scope=%s; Sev0..Sev%d; interval=%.0fs",
+    log.info("ISSE alert agent started: %s; %d customer(s) from %s; interval=%.0fs",
              "DRY RUN (files nothing)" if s.dry_run else "filing requests",
-             ", ".join(s.scope_resource_group_tuple) or "whole subscription",
-             s.alert_min_severity, poll)
+             len(agent.register.customers), agent.register.source, poll)
     failures = 0
     while not stop["flag"]:
         start = time.time()
         try:
-            agent.cycle()
-            failures = 0
-            _beat(s)
+            report = agent.cycle()
+            _beat(s, report.reached)
+            # One unreadable customer is reported in the cycle and by `health`; only
+            # an outage that reaches nobody slows the loop down.
+            failures = failures + 1 if report.reached_nothing else 0
         except ServiceDeskAuthError as e:
             failures += 1
             log.error("ServiceDesk credentials unusable - a person must re-mint them: %s", e)
@@ -188,25 +227,61 @@ def watch(interval: float = typer.Option(None, help="Seconds between polls")) ->
 
 @app.command()
 def health(max_age: float = typer.Option(0, help="Seconds; default 4x the poll interval")) -> None:
-    """Exit 0 if the watcher completed a cycle recently, 1 otherwise."""
+    """Exit 0 if every registered customer was read recently, 1 otherwise."""
+    from .customers import RegisterError, load_register
+
     s = get_settings(reload=True)
     limit = max_age or max(120.0, s.poll_interval_seconds * 4)
-    path = Path(s.heartbeat_file)
-    if not path.exists():
-        typer.echo(f"no heartbeat at {path}")
-        raise typer.Exit(code=1)
-    age = time.time() - path.stat().st_mtime
-    ok = age <= limit
-    typer.echo(f"last cycle {age:.0f}s ago (limit {limit:.0f}s): {'healthy' if ok else 'STALE'}")
-    if not ok:
-        raise typer.Exit(code=1)
-
-
-def _beat(s: Settings) -> None:
     try:
-        path = Path(s.heartbeat_file)
+        names = [c.name for c in load_register(s).customers]
+    except RegisterError as e:
+        typer.echo(f"customer register rejected: {e}")
+        raise typer.Exit(code=1) from e
+    beats = _read_beats(Path(s.heartbeat_file))
+    if beats is None:
+        typer.echo(f"no heartbeat at {s.heartbeat_file}")
+        raise typer.Exit(code=1)
+    now = time.time()
+    stale = []
+    for name in names:
+        last = beats.get(name)
+        if last is None:
+            stale.append(name)
+            typer.echo(f"  {name}: never read: STALE")
+            continue
+        age = now - last
+        ok = age <= limit
+        if not ok:
+            stale.append(name)
+        typer.echo(f"  {name}: last read {age:.0f}s ago: {'healthy' if ok else 'STALE'}")
+    typer.echo(f"limit {limit:.0f}s; {len(names) - len(stale)}/{len(names)} healthy")
+    if stale or not names:
+        raise typer.Exit(code=1)
+
+
+def _read_beats(path: Path) -> dict[str, float] | None:
+    """Last successful read per customer, from the heartbeat file."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}
+    customers = data.get("customers") if isinstance(data, dict) else None
+    if not isinstance(customers, dict):
+        return {}
+    return {str(k): float(v) for k, v in customers.items() if isinstance(v, (int, float))}
+
+
+def _beat(s: Settings, reached: list[str]) -> None:
+    """Record which customers this cycle read, keeping the last success of the rest."""
+    path = Path(s.heartbeat_file)
+    try:
+        beats = _read_beats(path) or {}
+        now = time.time()
+        beats.update({name: now for name in reached})
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(str(time.time()), encoding="utf-8")
+        path.write_text(json.dumps({"ts": now, "customers": beats}), encoding="utf-8")
     except OSError as e:
         log.warning("heartbeat not written: %s", e)
 

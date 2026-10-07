@@ -1,0 +1,62 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-08-01/subscriptionDeploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "mspOfferName": {
+      "type": "string",
+      "defaultValue": "ISSE alert intake (read-only)",
+      "metadata": { "description": "Shown to the customer under Service providers. Keep it the same for every subscription of a customer." }
+    },
+    "mspOfferDescription": {
+      "type": "string",
+      "defaultValue": "Lets the ISSE alert agent read Azure Monitor alerts on this subscription. Read-only: it cannot change any resource."
+    },
+    "managedByTenantId": {
+      "type": "string",
+      "metadata": { "description": "Our (the managing) Entra tenant id - the AZURE_TENANT_ID the agent runs with." }
+    },
+    "principalId": {
+      "type": "string",
+      "metadata": { "description": "Object id of the alert agent's service principal (enterprise application) in our tenant - not its client id." }
+    },
+    "principalIdDisplayName": {
+      "type": "string",
+      "defaultValue": "ISSE alert agent"
+    }
+  },
+  "variables": {
+    "monitoringReader": "43d0d8ad-25c7-4714-9337-8ba259a9fe05",
+    "registrationName": "[guid(parameters('mspOfferName'))]",
+    "assignmentName": "[guid(parameters('mspOfferName'), subscription().subscriptionId)]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.ManagedServices/registrationDefinitions",
+      "apiVersion": "2022-10-01",
+      "name": "[variables('registrationName')]",
+      "properties": {
+        "registrationDefinitionName": "[parameters('mspOfferName')]",
+        "description": "[parameters('mspOfferDescription')]",
+        "managedByTenantId": "[parameters('managedByTenantId')]",
+        "authorizations": [
+          {
+            "principalId": "[parameters('principalId')]",
+            "principalIdDisplayName": "[parameters('principalIdDisplayName')]",
+            "roleDefinitionId": "[variables('monitoringReader')]"
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.ManagedServices/registrationAssignments",
+      "apiVersion": "2022-10-01",
+      "name": "[variables('assignmentName')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedServices/registrationDefinitions/', variables('registrationName'))]"
+      ],
+      "properties": {
+        "registrationDefinitionId": "[resourceId('Microsoft.ManagedServices/registrationDefinitions/', variables('registrationName'))]"
+      }
+    }
+  ]
+}

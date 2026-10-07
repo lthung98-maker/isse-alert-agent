@@ -3,8 +3,9 @@
 Same conventions as ISSE: pydantic-settings, read once at process start, loaded from the
 process environment and an optional ``.env`` in the repo root. The alias names are kept
 identical to ISSE's where the two read the same thing (``AZURE_*``, ``SDP_*``,
-``ISSE_SANDBOX_RESOURCE_GROUP``, ``ISSE_POLL_INTERVAL_SECONDS``) so one per-customer
-``.env`` can serve both the agent and the pipeline on the same host.
+``ISSE_SANDBOX_RESOURCE_GROUP``, ``ISSE_POLL_INTERVAL_SECONDS``). Which customers there
+are, and where their alerts go, is not here: it is the customer register
+(:mod:`isse_alert_agent.customers`).
 """
 
 from __future__ import annotations
@@ -27,21 +28,32 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # ---- Azure (read-only: Monitoring Reader at subscription scope) ----
-    azure_subscription_id: Optional[str] = Field(None, alias="AZURE_SUBSCRIPTION_ID")
+    # ---- Customers ----
+    # The customer register (YAML): each customer's subscriptions, scoped resource
+    # groups, queue and SLA. See deploy/customers.example.yaml. Unset = one customer
+    # from AZURE_SUBSCRIPTION_ID / ISSE_SANDBOX_RESOURCE_GROUP / SDP_QUEUE below.
+    customers_file: str = Field("", alias="ISSE_ALERT_CUSTOMERS_FILE")
+
+    # ---- Azure (read-only: Monitoring Reader on every registered subscription) ----
+    # One identity for every customer: in our own tenant, with Monitoring Reader
+    # delegated to it on each customer subscription through Azure Lighthouse.
     azure_tenant_id: Optional[str] = Field(None, alias="AZURE_TENANT_ID")
     azure_client_id: Optional[str] = Field(None, alias="AZURE_CLIENT_ID")
     azure_client_secret: Optional[str] = Field(None, alias="AZURE_CLIENT_SECRET")
 
-    # ---- Which alerts become requests ----
+    # ---- Single-customer mode (no register file) ----
+    azure_subscription_id: Optional[str] = Field(None, alias="AZURE_SUBSCRIPTION_ID")
     # Resource groups the agent will file requests for. Shared alias with ISSE so the
     # agent is scoped to exactly the estate the pipeline is allowed to work - which is
     # what keeps alert volume bounded (Phase 2 plan, risk 1). Empty = the whole
     # subscription, which should only be used in a sandbox.
     scope_resource_groups: str = Field("", alias="ISSE_SANDBOX_RESOURCE_GROUP")
+
+    # ---- Which alerts become requests ----
     # Only alerts at or above this severity raise a request, as an Azure Sev *rank*:
     # 0 is critical and 4 is verbose, so 2 means Sev0/Sev1/Sev2 and drops the two
     # informational tiers. The monitor's own severity, never the agent's judgement.
+    # The default for customers whose register entry sets none.
     alert_min_severity: int = Field(2, alias="ISSE_ALERT_MIN_SEVERITY")
     # How far back each poll looks. Azure buckets this to 1h / 1d / 7d / 30d.
     alert_lookback_hours: int = Field(1, alias="ISSE_ALERT_LOOKBACK_HOURS")
@@ -49,7 +61,8 @@ class Settings(BaseSettings):
     # ---- Loop + dedup ----
     poll_interval_seconds: float = Field(30.0, alias="ISSE_POLL_INTERVAL_SECONDS")
     # Durable, so a 30-second poll never files the same alert twice across a restart.
-    # Per-customer, like the pipeline's audit DB.
+    # One store for every customer: an alert id embeds its subscription, so ids from
+    # different customers never collide.
     dedup_db_path: str = Field(str(REPO_ROOT / "data" / "alerts-seen.db"),
                                alias="ISSE_ALERT_DEDUP_DB")
     # Discover and log, but do not file anything. The safe default for a first run
@@ -70,6 +83,7 @@ class Settings(BaseSettings):
     sdp_client_id: Optional[str] = Field(None, alias="SDP_CLIENT_ID")
     sdp_client_secret: Optional[str] = Field(None, alias="SDP_CLIENT_SECRET")
     sdp_refresh_token: Optional[str] = Field(None, alias="SDP_REFRESH_TOKEN")
+    # Single-customer mode only; with a register each customer names its own queue.
     sdp_queue: str = Field("ISSE-Standby", alias="SDP_QUEUE")
 
     @property
@@ -78,30 +92,13 @@ class Settings(BaseSettings):
                      if rg.strip())
 
     @property
-    def azure_is_configured(self) -> bool:
-        return bool(self.azure_subscription_id)
+    def azure_service_principal(self) -> bool:
+        return bool(self.azure_client_id and self.azure_client_secret and self.azure_tenant_id)
 
     @property
     def sdp_is_configured(self) -> bool:
         return bool(self.sdp_portal and self.sdp_client_id and self.sdp_client_secret
                     and self.sdp_refresh_token)
-
-    def scoped_group(self, resource_group: Optional[str]) -> Optional[str]:
-        """The configured spelling of ``resource_group``, or None if it is out of scope.
-
-        Azure Monitor often lower-cases the resource ids it reports, and ISSE's guardrail
-        compares the request's resource group against its scope exactly. Writing the
-        monitor's spelling onto the request would have ISSE refuse an in-scope machine,
-        so the request carries the scope's own spelling. With no scope configured the
-        whole subscription is in scope and the monitor's spelling is all there is.
-        """
-        if not resource_group:
-            return None
-        groups = self.scope_resource_group_tuple
-        if not groups:
-            return resource_group
-        wanted = resource_group.strip().lower()
-        return next((g for g in groups if g.lower() == wanted), None)
 
 
 _settings: Optional[Settings] = None

@@ -3,8 +3,12 @@
 A thin read over Microsoft.AlertsManagement at *subscription* scope - the same call
 ISSE makes per-VM for evidence, taken estate-wide so the agent can go looking rather
 than waiting for a payload on a ticket. This is the only Azure surface the agent
-touches, and it is read-only, which is why the service principal needs just
-``Monitoring Reader`` at subscription scope and nothing that can change a machine.
+touches, and it is read-only, which is why the identity needs just ``Monitoring
+Reader`` on each subscription and nothing that can change a machine.
+
+One credential serves every subscription. Under Azure Lighthouse the customers'
+subscriptions are delegated to an identity in our own tenant, so the same token reads
+all of them; only the client, which is bound to a subscription, differs.
 
 The Azure SDK import is deferred into the client so importing this module (for its
 ``AlertReader`` type, or in a test that injects a fake) never requires the SDK.
@@ -21,7 +25,8 @@ from .models import Alert, AlertCondition
 class AlertReader(Protocol):
     """What the agent needs from a source of alerts. A fake satisfies this in tests."""
 
-    def list_fired_alerts(self, hours: int = 1, max_rank: int = 4) -> list[Alert]:
+    def list_fired_alerts(self, subscription: str, hours: int = 1,
+                          max_rank: int = 4) -> list[Alert]:
         ...
 
 
@@ -124,41 +129,48 @@ def to_alert(item: Any) -> Alert:
 
 
 class AzureAlertReader:
-    """Lists firing VM alerts across the subscription via Microsoft.AlertsManagement."""
+    """Lists firing VM alerts in a subscription via Microsoft.AlertsManagement."""
 
     def __init__(self, settings: Optional[Settings] = None) -> None:
         self._s = settings or get_settings()
-        self._client_obj = None
+        self._cred = None
+        self._clients: dict[str, Any] = {}
 
-    def _client(self):
-        # Built once and reused: the credential holds the token cache, and a new one per
-        # poll would mint a fresh token every thirty seconds.
-        if self._client_obj is None:
+    def _credential(self):
+        # Built once and shared: the credential holds the token cache, and a new one per
+        # poll would mint a fresh token every thirty seconds for every subscription.
+        if self._cred is None:
             from azure.identity import ClientSecretCredential, DefaultAzureCredential
-            from azure.mgmt.alertsmanagement import AlertsManagementClient
 
-            if not self._s.azure_subscription_id:
-                raise RuntimeError("AZURE_SUBSCRIPTION_ID is not set")
-            cid, secret, tenant = (self._s.azure_client_id, self._s.azure_client_secret,
-                                   self._s.azure_tenant_id)
-            if cid and secret and tenant:
-                cred = ClientSecretCredential(tenant_id=tenant, client_id=cid,
-                                              client_secret=secret)
+            if self._s.azure_service_principal:
+                self._cred = ClientSecretCredential(tenant_id=self._s.azure_tenant_id,
+                                                    client_id=self._s.azure_client_id,
+                                                    client_secret=self._s.azure_client_secret)
             else:
                 # Never the interactive browser: under systemd it would wait for a click
                 # that never comes, and the agent would look alive while doing nothing.
-                cred = DefaultAzureCredential(exclude_interactive_browser_credential=True)
-            self._client_obj = AlertsManagementClient(cred, self._s.azure_subscription_id)
-        return self._client_obj
+                self._cred = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+        return self._cred
 
-    def list_fired_alerts(self, hours: int = 1, max_rank: int = 4) -> list[Alert]:
-        """Every still-firing, unacknowledged VM alert Azure holds, worst severity first.
+    def _client(self, subscription: str):
+        key = subscription.lower()
+        if key not in self._clients:
+            from azure.mgmt.alertsmanagement import AlertsManagementClient
+
+            self._clients[key] = AlertsManagementClient(self._credential(), subscription)
+        return self._clients[key]
+
+    def list_fired_alerts(self, subscription: str, hours: int = 1,
+                          max_rank: int = 4) -> list[Alert]:
+        """Every still-firing, unacknowledged VM alert in ``subscription``, worst first.
 
         ``max_rank`` is the least-severe rank to include: 0 keeps only critical, 4 keeps
         everything. ``alert_state="New"`` leaves out alerts a person has already
         acknowledged or closed in the portal - somebody is on those.
         """
-        found = self._client().alerts.get_all(
+        if not subscription:
+            raise RuntimeError("no subscription to read alerts from")
+        found = self._client(subscription).alerts.get_all(
             time_range=_time_range(hours),
             monitor_condition="Fired",
             alert_state="New",

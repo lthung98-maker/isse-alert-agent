@@ -100,10 +100,10 @@ def test_request_carries_the_scopes_spelling_of_a_lowercased_resource_group(tmp_
 
 
 class _ExplodingFiler(FakeFiler):
-    def create_request(self, subject, description, udf_fields=None):
+    def create_request(self, subject, description, udf_fields=None, **kw):
         if "GG4RDGPRD01" in subject:
             raise ConnectionError("portal reset the connection")
-        return super().create_request(subject, description, udf_fields)
+        return super().create_request(subject, description, udf_fields, **kw)
 
 
 def test_one_alert_failing_does_not_stop_the_others(tmp_path, monkeypatch):

@@ -34,7 +34,8 @@ class RequestFiler(Protocol):
     """What the agent needs to file a request. A fake satisfies this in tests."""
 
     def create_request(self, subject: str, description: str,
-                       udf_fields: Optional[dict] = None) -> CreatedRequest:
+                       udf_fields: Optional[dict] = None, queue: Optional[str] = None,
+                       priority: Optional[str] = None) -> CreatedRequest:
         ...
 
 
@@ -88,10 +89,24 @@ class ServiceDeskFiler:
         )
 
     def create_request(self, subject: str, description: str,
-                       udf_fields: Optional[dict] = None) -> CreatedRequest:
-        request: dict = {"subject": subject, "description": description}
+                       udf_fields: Optional[dict] = None, queue: Optional[str] = None,
+                       priority: Optional[str] = None) -> CreatedRequest:
+        """File one request into ``queue`` (the customer's ServiceDesk group).
+
+        The queue is what routes a request to its customer's ISSE, so it is never
+        dropped to make a request land: a request outside its queue reaches no one, or
+        the wrong customer. UDFs and priority are conveniences and are dropped on a
+        rejection, because the target is also in the description and ISSE derives its
+        own priority anyway.
+        """
+        essential: dict = {"subject": subject, "description": description}
+        if queue:
+            essential["group"] = {"name": queue}
+        request = dict(essential)
         if udf_fields:
             request["udf_fields"] = udf_fields
+        if priority:
+            request["priority"] = {"name": priority}
         r = self._post_request(request)
         if r.status_code == 401:
             # Revoked or expired early; mint once more before calling it a failure.
@@ -101,12 +116,15 @@ class ServiceDeskFiler:
                 raise ServiceDeskAuthError("ServiceDesk refused the access token (HTTP 401)")
 
         result = _result(r)
-        if not result.ok and udf_fields:
-            # A portal whose request template lacks these UDFs rejects the whole request.
-            # The target is also in the description and the payload, so file without them
+        if not result.ok and request != essential:
+            # A portal whose request template lacks these UDFs, or that names its
+            # priorities differently, rejects the whole request. File without them
             # rather than not at all, and say so.
-            retry = _result(self._post_request({"subject": subject, "description": description}))
-            retry.detail = f"{retry.detail}; filed without UDFs after: {result.detail}"
+            dropped = " and ".join(label for key, label in (("udf_fields", "UDFs"),
+                                                            ("priority", "priority"))
+                                   if key in request)
+            retry = _result(self._post_request(essential))
+            retry.detail = f"{retry.detail}; filed without {dropped} after: {result.detail}"
             return retry
         return result
 

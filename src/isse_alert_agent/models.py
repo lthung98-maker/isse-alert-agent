@@ -35,6 +35,12 @@ def severity_meaning(severity: Optional[str]) -> str:
     return f"{severity} ({label})" if label else str(severity)
 
 
+def severity_rank(severity: Optional[str]) -> Optional[int]:
+    """0 (critical) to 4 (verbose) from "Sev2" or "2", or None if it names no severity."""
+    m = re.fullmatch(r"\s*(?:sev)?\s*([0-4])\s*", str(severity or ""), re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
 def _arm_part(resource_id: Optional[str], segment: str) -> Optional[str]:
     """The value following ``segment`` in an ARM resource id, case-insensitively."""
     parts = str(resource_id or "").strip("/").split("/")
@@ -104,8 +110,7 @@ class Alert:
     @property
     def severity_rank(self) -> Optional[int]:
         """0 (critical) to 4 (verbose), or None if the alert carries no severity."""
-        m = re.search(r"(\d)", self.severity or "")
-        return int(m.group(1)) if m else None
+        return severity_rank(self.severity)
 
     @property
     def target_id(self) -> Optional[str]:

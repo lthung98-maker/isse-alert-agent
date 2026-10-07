@@ -1,0 +1,49 @@
+# ISSE Alert Agent - customer register.
+# Point ISSE_ALERT_CUSTOMERS_FILE at a copy of this file. It is the only thing that
+# decides which customer an alert belongs to, so the agent refuses to start if it is
+# ambiguous (a subscription under two customers, a customer with no queue, ...).
+#
+# No secrets here. Azure access is one identity for every customer (Monitoring Reader
+# delegated to it on each subscription through Azure Lighthouse); ServiceDesk is one
+# portal (SDP_* in the environment), with a queue per customer.
+
+defaults:
+  # Least-severe Azure Sev rank filed: 0 = critical only ... 4 = everything.
+  min_severity: 2
+  # The SLA: ServiceDesk priority to open a request at, per alert severity. Names must
+  # match the portal's priorities exactly. Unmapped severities get the portal default.
+  # ISSE only ever raises a priority, so keep this a floor - a priority set too high
+  # here is never lowered.
+  priority_by_severity:
+    Sev0: High
+    Sev1: Medium
+
+customers:
+  - name: Goodrich
+    # The ServiceDesk group requests are filed into - and the queue this customer's
+    # ISSE instance watches (SDP_QUEUE with ISSE_SDP_QUEUE_FILTER=true on that side).
+    queue: ISSE-Goodrich
+    subscriptions:
+      - id: 00000000-0000-0000-0000-000000000001
+        # Only these groups are filed. Matched case-insensitively; written onto the
+        # request as spelled here, because ISSE's guardrail compares exactly.
+        resource_groups: [RG-GG4-STANDALONE-TEST]
+
+  - name: Shared Cloud
+    queue: ISSE-SharedCloud
+    min_severity: 1
+    priority_by_severity:
+      Sev0: Urgent
+      Sev1: High
+    subscriptions:
+      - id: 00000000-0000-0000-0000-000000000002
+        resource_groups: [RG-SAA-AAE-SPC-PRD-1]
+      # No resource_groups: the whole subscription is in scope (sandbox only).
+      - id: 00000000-0000-0000-0000-000000000003
+
+  # A customer being onboarded: kept in the file, not polled.
+  - name: Next Customer
+    enabled: false
+    queue: ISSE-NextCustomer
+    subscriptions:
+      - id: 00000000-0000-0000-0000-000000000004

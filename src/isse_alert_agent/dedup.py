@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS alerts_seen (
     ts             REAL NOT NULL,
     ticket_id      TEXT,
     rule           TEXT,
-    vm_name        TEXT
+    vm_name        TEXT,
+    customer       TEXT
 );
 """
 
@@ -33,6 +34,9 @@ class DedupStore:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.executescript(_SCHEMA)
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(alerts_seen)")}
+        if "customer" not in columns:
+            self._conn.execute("ALTER TABLE alerts_seen ADD COLUMN customer TEXT")
         self._conn.commit()
 
     def seen(self, alert_id: Optional[str]) -> bool:
@@ -45,14 +49,15 @@ class DedupStore:
         return row is not None
 
     def record(self, alert_id: Optional[str], ticket_id: Optional[str] = None,
-               rule: Optional[str] = None, vm_name: Optional[str] = None) -> None:
+               rule: Optional[str] = None, vm_name: Optional[str] = None,
+               customer: Optional[str] = None) -> None:
         if not alert_id:
             return
         with self._lock:
             self._conn.execute(
-                "INSERT OR IGNORE INTO alerts_seen (alert_id, ts, ticket_id, rule, vm_name) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (alert_id, time.time(), ticket_id, rule, vm_name),
+                "INSERT OR IGNORE INTO alerts_seen "
+                "(alert_id, ts, ticket_id, rule, vm_name, customer) VALUES (?, ?, ?, ?, ?, ?)",
+                (alert_id, time.time(), ticket_id, rule, vm_name, customer),
             )
             self._conn.commit()
 

@@ -1,6 +1,8 @@
-# Templated systemd unit: one instance per customer.
-#   sudo systemctl enable --now isse-alerts@acme
-# expects /srv/isse/acme/.env (see deploy/env.example) and a venv with this package.
+# Templated systemd unit. One instance serves every customer in its register; the
+# instance name is only the deployment directory.
+#   sudo systemctl enable --now isse-alerts@estate
+# expects /srv/isse/estate/.env and customers.yaml (see deploy/) and a venv with this
+# package.
 [Unit]
 Description=ISSE Alert Agent (%i) - Azure Monitor intake
 After=network-online.target

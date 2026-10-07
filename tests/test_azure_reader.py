@@ -92,11 +92,13 @@ def test_reader_queries_fired_new_alerts_and_keeps_only_vms_at_or_above_the_floo
         _item(alert_guid="c", severity="Sev2", vm_id=storage_id),  # not a VM
         _item(alert_guid="d", severity="Sev0"),                    # kept, worst first
     ])
-    reader = AzureAlertReader(settings=NS(azure_subscription_id=_SUB))
-    monkeypatch.setattr(reader, "_client", lambda: client)
+    reader = AzureAlertReader(settings=NS())
+    asked: list[str] = []
+    monkeypatch.setattr(reader, "_client", lambda sub: asked.append(sub) or client)
 
-    alerts = reader.list_fired_alerts(hours=1, max_rank=2)
+    alerts = reader.list_fired_alerts(_SUB, hours=1, max_rank=2)
 
+    assert asked == [_SUB]
     assert [a.alert_id.rsplit("/", 1)[-1] for a in alerts] == ["d", "b"]
     assert client.kwargs["monitor_condition"] == "Fired"
     assert client.kwargs["alert_state"] == "New"
