@@ -1,0 +1,25 @@
+# Templated systemd unit: one instance per customer.
+#   sudo systemctl enable --now isse-alerts@acme
+# expects /srv/isse/acme/.env (see deploy/env.example) and a venv with this package.
+[Unit]
+Description=ISSE Alert Agent (%i) - Azure Monitor intake
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=isse
+Group=isse
+WorkingDirectory=/srv/isse/%i
+EnvironmentFile=/srv/isse/%i/.env
+ExecStart=/srv/isse/%i/venv/bin/isse-alerts watch
+Restart=on-failure
+RestartSec=10
+# Read-only agent: it can create a ServiceDesk request and nothing else.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/srv/isse/%i
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
