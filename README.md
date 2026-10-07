@@ -37,13 +37,25 @@ already filed (durable dedup)?   yes → skip
 ```bash
 pip install -e ".[dev]"
 
-isse-alerts list     # read-only: print firing VM alerts Azure holds in scope
+isse-alerts doctor   # read-only preflight: config, Azure read, ServiceDesk token
+isse-alerts list     # read-only: firing VM alerts Azure holds, marked in/out of scope
 isse-alerts once     # one poll cycle (files requests unless ISSE_ALERT_DRY_RUN=true)
 isse-alerts watch    # poll forever at ISSE_POLL_INTERVAL_SECONDS
+isse-alerts health   # exit 0 if `watch` completed a cycle recently (for a monitor)
 ```
 
-Set `ISSE_ALERT_DRY_RUN=true` for a first run against a new subscription: it discovers
-and logs but files nothing.
+Bringing up a new customer, in order: `doctor` until it exits 0, then `list`, then
+`once` with `ISSE_ALERT_DRY_RUN=true` (discovers and logs, files nothing), then `once`
+for real, then `watch`.
+
+`watch` survives transient failures: a failed cycle is logged and retried with backoff
+(up to 8x the poll interval), and one bad alert never blocks the others. A ServiceDesk
+**authentication** failure is logged as needing a person (a refresh token does not fix
+itself) but the loop keeps trying, so the agent recovers once the token is replaced.
+
+Resource-group scope matching is case-insensitive (Azure Monitor lowercases resource
+IDs), and the request carries the group **as spelled in `ISSE_SANDBOX_RESOURCE_GROUP`**,
+because the pipeline's guardrail scope check is case-sensitive.
 
 ## Configuration
 
@@ -64,6 +76,10 @@ DB), via the templated `deploy/isse-alerts@.service`:
 sudo systemctl enable --now isse-alerts@acme   # reads /srv/isse/acme/.env
 ```
 
+For monitoring, run `isse-alerts health` (same environment) from a timer or
+monitoring agent; it fails if no cycle has reached Azure within 4x the poll interval,
+which catches a process that is alive but stuck.
+
 A `Dockerfile` is provided for local development; no GPU and no baked-in credentials.
 
 ## Tests
@@ -74,6 +90,11 @@ pytest -q
 
 The suite runs fully offline against fakes (`tests/fakes.py`) — no Azure, no
 ServiceDesk, no credentials — which is what lets CI run on every pull request.
+
+`tests/test_isse_interop.py` goes further: it feeds a request this agent filed into the
+**real** ISSE pipeline (parser, alert reconciliation, and a sim-mode orchestrator run)
+and checks the machine is confirmed from the alert. It looks for ISSE at
+`$ISSE_AGENT_SRC` or a sibling `../isse-agent/src`, and skips if neither exists.
 
 ## Not in scope
 

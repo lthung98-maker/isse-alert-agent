@@ -6,7 +6,7 @@ than waiting for a payload on a ticket. This is the only Azure surface the agent
 touches, and it is read-only, which is why the service principal needs just
 ``Monitoring Reader`` at subscription scope and nothing that can change a machine.
 
-The Azure SDK import is deferred into the call so importing this module (for its
+The Azure SDK import is deferred into the client so importing this module (for its
 ``AlertReader`` type, or in a test that injects a fake) never requires the SDK.
 """
 
@@ -40,6 +40,32 @@ def _plain(value: Any) -> Optional[str]:
     return text or None
 
 
+def _when(value: Any) -> Optional[str]:
+    """ISO-8601 for a datetime, the text itself for anything else."""
+    if value is None or value == "":
+        return None
+    iso = getattr(value, "isoformat", None)
+    return iso() if callable(iso) else (str(value).strip() or None)
+
+
+def _rule_name(alert_rule: Optional[str]) -> Optional[str]:
+    """The rule's name from the ARM id the store returns for it.
+
+    Essentials carry the rule as ``/subscriptions/.../metricalerts/High CPU``; the
+    common alert schema, and every person reading the ticket, call it "High CPU".
+    """
+    if not alert_rule:
+        return None
+    return alert_rule.rstrip("/").rsplit("/", 1)[-1] or alert_rule
+
+
+def _number(value: Any) -> Optional[float]:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def _conditions(context: Any) -> list[AlertCondition]:
     """Conditions from the alert's ``context``, for signal types that carry a threshold."""
     if not isinstance(context, dict):
@@ -47,7 +73,7 @@ def _conditions(context: Any) -> list[AlertCondition]:
     inner = context.get("context") if isinstance(context.get("context"), dict) else context
     condition = inner.get("condition") if isinstance(inner, dict) else None
     blocks = (condition.get("allOf") if isinstance(condition, dict) else None) or []
-    window = (condition.get("windowSize") if isinstance(condition, dict) else None)
+    window = condition.get("windowSize") if isinstance(condition, dict) else None
     out: list[AlertCondition] = []
     for block in blocks:
         if not isinstance(block, dict):
@@ -64,34 +90,36 @@ def _conditions(context: Any) -> list[AlertCondition]:
     return out
 
 
-def _number(value: Any) -> Optional[float]:
-    try:
-        return float(str(value).strip())
-    except (TypeError, ValueError):
-        return None
+def to_alert(item: Any) -> Alert:
+    """One alert from Microsoft.AlertsManagement, read defensively.
 
-
-def _to_alert(item: Any) -> Alert:
-    """One alert from Microsoft.AlertsManagement, read defensively."""
-    e = getattr(getattr(item, "properties", None), "essentials", None)
+    The identifier is the alert's own resource id, never its ``name``. The store sets
+    ``name`` to the *rule* name, so deduplicating on it would file the first alert a
+    rule ever raised and silently drop every later one, on every machine.
+    """
+    props = getattr(item, "properties", None)
+    e = getattr(props, "essentials", None)
     target = _plain(getattr(e, "target_resource", None))
+    rule = _rule_name(_plain(getattr(e, "alert_rule", None)))
     alert = Alert(
-        rule=_plain(getattr(e, "alert_rule", None)),
-        alert_id=_plain(getattr(item, "name", None)) or _plain(getattr(item, "id", None)),
+        rule=rule or _plain(getattr(item, "name", None)),
+        alert_id=_plain(getattr(item, "id", None)),
         severity=_plain(getattr(e, "severity", None)),
         signal_type=_plain(getattr(e, "signal_type", None)),
         monitor_condition=_plain(getattr(e, "monitor_condition", None)),
         monitoring_service=_plain(getattr(e, "monitor_service", None)),
         alert_state=_plain(getattr(e, "alert_state", None)),
-        fired_at=str(getattr(e, "start_date_time", "") or "") or None,
-        resolved_at=str(getattr(e, "monitor_condition_resolved_date_time", "") or "") or None,
+        fired_at=_when(getattr(e, "start_date_time", None)),
+        resolved_at=_when(getattr(e, "monitor_condition_resolved_date_time", None)),
         description=_plain(getattr(e, "description", None)),
         target_ids=[target] if target else [],
     )
+    # The resource's own name, in the case it was created with. The target id is often
+    # lower-cased by the monitor, and the name is what a person and ISSE both look for.
     name = _plain(getattr(e, "target_resource_name", None))
     if name:
         alert.configuration_items = [name]
-    alert.conditions = _conditions(getattr(getattr(item, "properties", None), "context", None))
+    alert.conditions = _conditions(getattr(props, "context", None))
     return alert
 
 
@@ -100,26 +128,35 @@ class AzureAlertReader:
 
     def __init__(self, settings: Optional[Settings] = None) -> None:
         self._s = settings or get_settings()
+        self._client_obj = None
 
     def _client(self):
-        from azure.identity import ClientSecretCredential, DefaultAzureCredential
-        from azure.mgmt.alertsmanagement import AlertsManagementClient
+        # Built once and reused: the credential holds the token cache, and a new one per
+        # poll would mint a fresh token every thirty seconds.
+        if self._client_obj is None:
+            from azure.identity import ClientSecretCredential, DefaultAzureCredential
+            from azure.mgmt.alertsmanagement import AlertsManagementClient
 
-        cid, secret, tenant = (self._s.azure_client_id, self._s.azure_client_secret,
-                               self._s.azure_tenant_id)
-        if cid and secret and tenant:
-            cred = ClientSecretCredential(tenant_id=tenant, client_id=cid, client_secret=secret)
-        else:
-            cred = DefaultAzureCredential(exclude_interactive_browser_credential=False)
-        return AlertsManagementClient(cred, self._s.azure_subscription_id)
+            if not self._s.azure_subscription_id:
+                raise RuntimeError("AZURE_SUBSCRIPTION_ID is not set")
+            cid, secret, tenant = (self._s.azure_client_id, self._s.azure_client_secret,
+                                   self._s.azure_tenant_id)
+            if cid and secret and tenant:
+                cred = ClientSecretCredential(tenant_id=tenant, client_id=cid,
+                                              client_secret=secret)
+            else:
+                # Never the interactive browser: under systemd it would wait for a click
+                # that never comes, and the agent would look alive while doing nothing.
+                cred = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+            self._client_obj = AlertsManagementClient(cred, self._s.azure_subscription_id)
+        return self._client_obj
 
     def list_fired_alerts(self, hours: int = 1, max_rank: int = 4) -> list[Alert]:
-        """Every still-firing VM alert Azure holds, worst severity first.
+        """Every still-firing, unacknowledged VM alert Azure holds, worst severity first.
 
-        Filtered to targets that are virtual machines and to severities at or above the
-        floor (``max_rank`` is the least-severe rank to include: 0 keeps only critical,
-        4 keeps everything). Closed and resolved alerts are dropped - the agent only
-        files work for something currently firing.
+        ``max_rank`` is the least-severe rank to include: 0 keeps only critical, 4 keeps
+        everything. ``alert_state="New"`` leaves out alerts a person has already
+        acknowledged or closed in the portal - somebody is on those.
         """
         found = self._client().alerts.get_all(
             time_range=_time_range(hours),
@@ -129,8 +166,8 @@ class AzureAlertReader:
         )
         out: list[Alert] = []
         for item in found:
-            alert = _to_alert(item)
-            if not alert.fired or alert.vm_name is None:
+            alert = to_alert(item)
+            if not alert.fired or alert.vm_name is None or not alert.alert_id:
                 continue
             rank = alert.severity_rank
             if rank is not None and rank > max_rank:

@@ -55,9 +55,16 @@ class Settings(BaseSettings):
     # Discover and log, but do not file anything. The safe default for a first run
     # against a new subscription.
     dry_run: bool = Field(False, alias="ISSE_ALERT_DRY_RUN")
+    # Touched after every cycle that reached Azure, so `isse-alerts health` (and a
+    # monitor behind it) can tell a working agent from a process that is merely alive.
+    heartbeat_file: str = Field(str(REPO_ROOT / "data" / "alerts-heartbeat"),
+                                alias="ISSE_ALERT_HEARTBEAT_FILE")
+    # "text" for a person watching the journal, "json" for a log shipper.
+    log_format: str = Field("text", alias="ISSE_LOG_FORMAT")
 
     # ---- ManageEngine ServiceDesk Plus Cloud (the one write path) ----
     sdp_data_center: str = Field("com", alias="SDP_DATA_CENTER")
+    sdp_portal: Optional[str] = Field(None, alias="SDP_PORTAL")
     sdp_api_base: str = Field("https://sdpondemand.manageengine.com", alias="SDP_API_BASE")
     sdp_oauth_base: str = Field("https://accounts.zoho.com", alias="SDP_OAUTH_BASE")
     sdp_client_id: Optional[str] = Field(None, alias="SDP_CLIENT_ID")
@@ -76,7 +83,25 @@ class Settings(BaseSettings):
 
     @property
     def sdp_is_configured(self) -> bool:
-        return bool(self.sdp_client_id and self.sdp_client_secret and self.sdp_refresh_token)
+        return bool(self.sdp_portal and self.sdp_client_id and self.sdp_client_secret
+                    and self.sdp_refresh_token)
+
+    def scoped_group(self, resource_group: Optional[str]) -> Optional[str]:
+        """The configured spelling of ``resource_group``, or None if it is out of scope.
+
+        Azure Monitor often lower-cases the resource ids it reports, and ISSE's guardrail
+        compares the request's resource group against its scope exactly. Writing the
+        monitor's spelling onto the request would have ISSE refuse an in-scope machine,
+        so the request carries the scope's own spelling. With no scope configured the
+        whole subscription is in scope and the monitor's spelling is all there is.
+        """
+        if not resource_group:
+            return None
+        groups = self.scope_resource_group_tuple
+        if not groups:
+            return resource_group
+        wanted = resource_group.strip().lower()
+        return next((g for g in groups if g.lower() == wanted), None)
 
 
 _settings: Optional[Settings] = None

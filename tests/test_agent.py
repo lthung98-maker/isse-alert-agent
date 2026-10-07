@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 
+from fakes import FakeFiler, FakeReader, sample_alert
+
 from isse_alert_agent.agent import AlertAgent
 from isse_alert_agent.config import Settings
-from fakes import FakeFiler, FakeReader, sample_alert
 
 
 def _settings(tmp_path, monkeypatch, scope="RG-GG4-STANDALONE-TEST", dry=False):
@@ -66,7 +67,7 @@ def test_a_failed_create_is_retried_not_deduped(tmp_path, monkeypatch):
     agent = AlertAgent(s, reader=reader, filer=filer)
 
     first = agent.poll()
-    second = agent.poll()
+    agent.poll()
 
     assert all(not r.created for r in first)
     assert len(filer.created) == 2  # attempted again, because the first did not land
@@ -83,6 +84,54 @@ def test_dry_run_discovers_but_files_nothing(tmp_path, monkeypatch):
     assert len(raised) == 1
     assert raised[0].created is False
     assert filer.created == []
+
+
+def test_request_carries_the_scopes_spelling_of_a_lowercased_resource_group(tmp_path,
+                                                                           monkeypatch):
+    # ISSE's guardrail compares the request's group to its scope exactly, and the
+    # monitor often reports ids lower-cased.
+    s = _settings(tmp_path, monkeypatch)
+    reader = FakeReader([sample_alert(alert_id="a1", rg="rg-gg4-standalone-test")])
+    filer = FakeFiler()
+    AlertAgent(s, reader=reader, filer=filer).poll()
+
+    assert filer.created[0]["udf"]["udf_char2"] == "RG-GG4-STANDALONE-TEST"
+    assert "Target: RG-GG4-STANDALONE-TEST / GG4DAXPRD03" in filer.created[0]["description"]
+
+
+class _ExplodingFiler(FakeFiler):
+    def create_request(self, subject, description, udf_fields=None):
+        if "GG4RDGPRD01" in subject:
+            raise ConnectionError("portal reset the connection")
+        return super().create_request(subject, description, udf_fields)
+
+
+def test_one_alert_failing_does_not_stop_the_others(tmp_path, monkeypatch):
+    s = _settings(tmp_path, monkeypatch)
+    reader = FakeReader([sample_alert(vm="GG4RDGPRD01", alert_id="a1"),
+                         sample_alert(alert_id="a2")])
+    agent = AlertAgent(s, reader=reader, filer=_ExplodingFiler())
+
+    report = agent.cycle()
+
+    assert len(report.filed) == 1
+    assert len(report.failed) == 1
+    assert "ConnectionError" in report.failed[0].detail
+
+
+def test_a_credential_failure_stops_the_cycle(tmp_path, monkeypatch):
+    import pytest
+
+    from isse_alert_agent.servicedesk import ServiceDeskAuthError
+
+    class _NoAuth(FakeFiler):
+        def create_request(self, *a, **k):
+            raise ServiceDeskAuthError("refresh token revoked")
+
+    s = _settings(tmp_path, monkeypatch)
+    agent = AlertAgent(s, reader=FakeReader([sample_alert(alert_id="a1")]), filer=_NoAuth())
+    with pytest.raises(ServiceDeskAuthError):
+        agent.cycle()
 
 
 def test_description_payload_is_valid_json(tmp_path, monkeypatch):

@@ -15,8 +15,9 @@ from __future__ import annotations
 
 from typing import Optional
 
-from isse_alert_agent import cas
 from fakes import sample_alert, sample_alert_with_condition
+
+from isse_alert_agent import cas
 
 # ---- FROZEN SNAPSHOT of isse.identification.alerts (do not edit to "fix" a test) ----
 

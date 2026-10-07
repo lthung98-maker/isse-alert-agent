@@ -15,7 +15,9 @@ Order of checks per alert, each one a reason to skip rather than file:
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+import logging
+from dataclasses import asdict, dataclass, field
+from html import escape
 from typing import Optional
 
 from . import cas
@@ -23,7 +25,9 @@ from .azure_alerts import AlertReader, AzureAlertReader
 from .config import Settings, get_settings
 from .dedup import DedupStore
 from .models import Alert, severity_meaning
-from .servicedesk import RequestFiler, ServiceDeskFiler
+from .servicedesk import RequestFiler, ServiceDeskAuthError, ServiceDeskFiler
+
+log = logging.getLogger("isse_alert_agent")
 
 
 @dataclass
@@ -40,6 +44,24 @@ class RaisedIncident:
         return asdict(self)
 
 
+@dataclass
+class CycleReport:
+    """What one poll found and did, for the log line and the CLI."""
+
+    discovered: int = 0
+    out_of_scope: int = 0
+    already_filed: int = 0
+    raised: list[RaisedIncident] = field(default_factory=list)
+
+    @property
+    def filed(self) -> list[RaisedIncident]:
+        return [r for r in self.raised if r.created]
+
+    @property
+    def failed(self) -> list[RaisedIncident]:
+        return [r for r in self.raised if r.detail.startswith("create failed")]
+
+
 class AlertAgent:
     def __init__(self, settings: Optional[Settings] = None,
                  reader: Optional[AlertReader] = None,
@@ -47,8 +69,15 @@ class AlertAgent:
                  dedup: Optional[DedupStore] = None) -> None:
         self._s = settings or get_settings()
         self._reader = reader or AzureAlertReader(self._s)
-        self._filer = filer or ServiceDeskFiler(self._s)
+        # Built lazily: a read-only `list` must not need ServiceDesk credentials.
+        self._filer = filer
         self._dedup = dedup or DedupStore(self._s.dedup_db_path)
+
+    @property
+    def filer(self) -> RequestFiler:
+        if self._filer is None:
+            self._filer = ServiceDeskFiler(self._s)
+        return self._filer
 
     # ---- read-only ----
     def discover(self) -> list[Alert]:
@@ -58,88 +87,110 @@ class AlertAgent:
             max_rank=self._s.alert_min_severity,
         )
 
-    def _in_scope(self, alert: Alert) -> bool:
-        groups = self._s.scope_resource_group_tuple
-        if not groups:
-            return True
-        rg = (alert.resource_group or "").lower()
-        return any(rg == g.lower() for g in groups)
-
     # ---- the one cycle ----
     def poll(self, create: Optional[bool] = None) -> list[RaisedIncident]:
+        return self.cycle(create).raised
+
+    def cycle(self, create: Optional[bool] = None) -> CycleReport:
         """One discovery pass: file a request for each new in-scope firing alert.
 
         ``create`` defaults to the inverse of ``dry_run`` - a dry run discovers and
         reports but files nothing, the safe first run against a new subscription.
+
+        A failure filing one alert does not stop the others; it is reported and, not
+        being recorded as filed, retried next cycle. A credential failure does stop the
+        cycle, because it will fail identically for every alert after it.
         """
         if create is None:
             create = not self._s.dry_run
-        raised: list[RaisedIncident] = []
+        report = CycleReport()
         for alert in self.discover():
-            if not self._in_scope(alert):
+            report.discovered += 1
+            group = self._s.scoped_group(alert.resource_group)
+            if group is None:
+                report.out_of_scope += 1
                 continue
             if self._dedup.seen(alert.alert_id):
+                report.already_filed += 1
                 continue
-            raised.append(self._raise(alert, create))
-        return raised
+            raised = self._raise(alert, group, create)
+            report.raised.append(raised)
+            log.info("%s: %s on %s -> %s (%s)",
+                     "filed" if raised.created else "not filed", alert.rule,
+                     raised.vm_name, raised.ticket_id or "-", raised.detail)
+        log.info("cycle: %d firing in window, %d out of scope, %d already filed, "
+                 "%d filed, %d failed", report.discovered, report.out_of_scope,
+                 report.already_filed, len(report.filed), len(report.failed))
+        return report
 
-    def _raise(self, alert: Alert, create: bool) -> RaisedIncident:
-        subject = self._subject(alert)
+    def _raise(self, alert: Alert, group: str, create: bool) -> RaisedIncident:
+        vm = alert.machine_name
+
+        def result(created: bool, detail: str, ticket: Optional[str] = None):
+            return RaisedIncident(alert_id=alert.alert_id, rule=alert.rule, vm_name=vm,
+                                  severity=alert.severity, ticket_id=ticket,
+                                  created=created, detail=detail)
+
         if not create:
-            return RaisedIncident(
-                alert_id=alert.alert_id, rule=alert.rule, vm_name=alert.vm_name,
-                severity=alert.severity, ticket_id=None, created=False,
-                detail="discovered; not filed (dry run)")
+            return result(False, "discovered; not filed (dry run)")
 
-        udf: dict = {}
-        if alert.vm_name:
-            udf["udf_char1"] = alert.vm_name
-        if alert.resource_group:
-            udf["udf_char2"] = alert.resource_group
-        result = self._filer.create_request(subject, self._description(alert),
-                                             udf_fields=udf or None)
-        if not result.ok:
-            # Not recorded as seen: a request that was not filed must be retried next
-            # cycle, not swallowed.
-            return RaisedIncident(
-                alert_id=alert.alert_id, rule=alert.rule, vm_name=alert.vm_name,
-                severity=alert.severity, ticket_id=result.id, created=False,
-                detail=f"create failed: {result.detail}")
+        udf = {"udf_char1": vm, "udf_char2": group} if vm else {}
+        try:
+            created = self.filer.create_request(self.subject(alert),
+                                                self.description(alert, group),
+                                                udf_fields=udf or None)
+        except ServiceDeskAuthError:
+            raise
+        except Exception as e:  # noqa: BLE001 - one alert must not stop the rest
+            return result(False, f"create failed: {type(e).__name__}: {e}")
+        if not created.ok:
+            # Not recorded as filed: a request that did not land is retried next cycle.
+            return result(False, f"create failed: {created.detail}")
 
-        self._dedup.record(alert.alert_id, ticket_id=result.id,
-                           rule=alert.rule, vm_name=alert.vm_name)
-        return RaisedIncident(
-            alert_id=alert.alert_id, rule=alert.rule, vm_name=alert.vm_name,
-            severity=alert.severity, ticket_id=result.id, created=True,
-            detail=f"request filed ({result.detail})")
+        self._dedup.record(alert.alert_id, ticket_id=created.id, rule=alert.rule, vm_name=vm)
+        return result(True, f"request filed ({created.detail})", created.id)
 
     # ---- the request the pipeline will read ----
     @staticmethod
-    def _subject(alert: Alert) -> str:
-        where = alert.vm_name or (alert.configuration_items[0]
-                                  if alert.configuration_items else "an Azure resource")
+    def subject(alert: Alert) -> str:
+        where = alert.machine_name or (alert.configuration_items[0]
+                                       if alert.configuration_items else "an Azure resource")
         sev = severity_meaning(alert.severity)
         rule = alert.rule or "Azure Monitor alert"
-        return f"[Azure Monitor] {rule} on {where}" + (f" ({sev})" if sev else "")
+        return f"[Azure Monitor] {where}: {rule}" + (f" - {sev}" if sev else "")
 
     @staticmethod
-    def _description(alert: Alert) -> str:
-        """A human lead-in, then the common alert schema payload the pipeline parses."""
-        lines = [
-            "Raised automatically by the ISSE alert agent from an Azure Monitor alert.",
-            "",
-            alert.summary(),
-        ]
-        if alert.vm_name:
-            lines.append("Affected machine: " + alert.vm_name
-                         + (f" in {alert.resource_group}" if alert.resource_group else ""))
-        for target in alert.target_ids:
-            lines.append(f"Resource id: {target}")
+    def description(alert: Alert, group: Optional[str] = None) -> str:
+        """The request body: a human lead-in, then the payload the pipeline parses.
+
+        ServiceDesk renders descriptions as HTML, so lines are escaped and joined with
+        ``<br>`` - and a real newline too, because ISSE's ticket parser anchors labelled
+        fields to line starts. The ``Target:`` line comes first on purpose: ISSE reads
+        ``<resource group> / <machine>`` before anything else, and the payload further
+        down contains a resource id that must not be the first such match.
+        """
+        vm = alert.machine_name
+        group = group or alert.resource_group
+        lines = ["Raised automatically by the ISSE alert agent from an Azure Monitor alert."]
+        if vm and group:
+            lines.append(f"Target: {group} / {vm}")
+        if vm:
+            lines.append(f"VM: {vm}")
+        if group:
+            lines.append(f"Resource group: {group}")
+        lines += ["", f"Alert: {alert.summary()}"]
+        if alert.description:
+            lines.append(f"Rule description: {alert.description}")
         for condition in alert.conditions:
             lines.append(f"Condition: {condition.describe()}")
-        lines += [
-            "",
-            "Azure Monitor common alert schema payload:",
-            json.dumps(cas.to_common_schema(alert)),
-        ]
-        return "\n".join(lines)
+        lines += ["", "Azure Monitor common alert schema payload:"]
+        body = "<br>\n".join(escape(line, quote=False) for line in lines)
+        return f"{body}<br>\n{_html_safe_json(cas.to_common_schema(alert))}"
+
+
+def _html_safe_json(payload: dict) -> str:
+    """JSON that is also inert HTML, so it reads back identically whether or not the
+    portal unescapes it: ``< > &`` become JSON unicode escapes, which mean the same
+    characters to any JSON parser and nothing at all to an HTML one."""
+    return (json.dumps(payload)
+            .replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e"))

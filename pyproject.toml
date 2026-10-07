@@ -31,5 +31,10 @@ where = ["src"]
 [tool.ruff]
 line-length = 100
 
+[tool.ruff.lint]
+# Pinned rather than ruff's default, which widens between releases and would turn a
+# routine upgrade into a red build.
+select = ["E", "F", "W", "I", "B"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

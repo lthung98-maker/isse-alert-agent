@@ -130,6 +130,18 @@ class Alert:
             return None
         return target.rstrip("/").rsplit("/", 1)[-1] or None
 
+    @property
+    def machine_name(self) -> Optional[str]:
+        """The VM's name in the case it was created with, where the alert carries it.
+
+        The target id is often lower-cased by the monitor; the resource name is not.
+        """
+        vm = self.vm_name
+        for item in self.configuration_items:
+            if vm and str(item).lower() == vm.lower():
+                return str(item)
+        return vm
+
     def summary(self) -> str:
         """One line naming the rule, its urgency and where it stands."""
         bits = [f"'{self.rule}'" if self.rule else "an unnamed rule"]
